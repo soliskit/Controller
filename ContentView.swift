@@ -95,6 +95,9 @@ private struct ConnectionCard: View {
                     if let category = monitor.productCategory, category != name {
                         Text(category).font(.caption).foregroundStyle(.secondary)
                     }
+                    Text("Input events received: \(monitor.inputEventCount)")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(monitor.inputEventCount > 0 ? Color.green : Color.orange)
                 } else {
                     Text("No controller").font(.headline)
                     Text("Pair your DualSense in Settings, Bluetooth. Hold PS and Create until the light bar flashes.")
