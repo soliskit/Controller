@@ -62,6 +62,10 @@ final class ControllerMonitor {
     private(set) var rightTrigger: Float = 0
     private(set) var pressedButtons: Set<String> = []
 
+    /// Counts every input change the controller reports, as a quick check
+    /// that input is reaching the app at all.
+    private(set) var inputEventCount = 0
+
     private(set) var log: [LogEntry] = []
 
     var isConnected: Bool { controllerName != nil }
@@ -83,6 +87,13 @@ final class ControllerMonitor {
 
     init() {
         addLog("App started. Waiting for a controller.")
+
+        // Swift Playgrounds runs the app in a hosted process that the system
+        // does not treat as the frontmost app. GameController only sends input
+        // to the frontmost app unless background monitoring is on, so without
+        // this the controller connects but no button or stick events arrive.
+        GCController.shouldMonitorBackgroundEvents = true
+        addLog("Background event monitoring on.")
 
         let center = NotificationCenter.default
         observers.append(center.addObserver(forName: .GCControllerDidConnect, object: nil, queue: .main) { [weak self] note in
@@ -142,6 +153,9 @@ final class ControllerMonitor {
             addLog("DualSense profile detected.")
         }
 
+        pad.valueChangedHandler = { [weak self] _, _ in
+            onMain { self?.inputEventCount += 1 }
+        }
         pad.dpad.valueChangedHandler = { [weak self] _, x, y in
             onMain { self?.dpadChanged(x: x, y: y) }
         }
@@ -205,6 +219,7 @@ final class ControllerMonitor {
         leftTrigger = 0
         rightTrigger = 0
         pressedButtons = []
+        inputEventCount = 0
         leftStickVertical = AxisZone()
         leftStickHorizontal = AxisZone()
     }

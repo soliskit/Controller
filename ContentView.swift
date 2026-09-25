@@ -54,6 +54,7 @@ private struct StatePanel: View {
                 Card(title: "Left Stick") { StickView(value: monitor.leftStick) }
                 Card(title: "Right Stick") { StickView(value: monitor.rightStick) }
             }
+            .fixedSize(horizontal: false, vertical: true)
 
             Card(title: "Triggers") {
                 VStack(spacing: 8) {
@@ -94,6 +95,9 @@ private struct ConnectionCard: View {
                     if let category = monitor.productCategory, category != name {
                         Text(category).font(.caption).foregroundStyle(.secondary)
                     }
+                    Text("Input events received: \(monitor.inputEventCount)")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(monitor.inputEventCount > 0 ? Color.green : Color.orange)
                 } else {
                     Text("No controller").font(.headline)
                     Text("Pair your DualSense in Settings, Bluetooth. Hold PS and Create until the light bar flashes.")
@@ -129,7 +133,7 @@ private struct Card<Content: View>: View {
             content
         }
         .padding()
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(.background.secondary, in: .rect(cornerRadius: 12))
     }
 }
@@ -228,6 +232,7 @@ private struct EventLog: View {
                     .id(entry.id)
                 }
                 .listStyle(.plain)
+                .scrollContentBackground(.hidden)
                 .onChange(of: monitor.log.last?.id) { _, id in
                     if let id {
                         proxy.scrollTo(id, anchor: .bottom)
