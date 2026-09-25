@@ -54,6 +54,7 @@ private struct StatePanel: View {
                 Card(title: "Left Stick") { StickView(value: monitor.leftStick) }
                 Card(title: "Right Stick") { StickView(value: monitor.rightStick) }
             }
+            .fixedSize(horizontal: false, vertical: true)
 
             Card(title: "Triggers") {
                 VStack(spacing: 8) {
@@ -129,7 +130,7 @@ private struct Card<Content: View>: View {
             content
         }
         .padding()
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(.background.secondary, in: .rect(cornerRadius: 12))
     }
 }
@@ -228,6 +229,7 @@ private struct EventLog: View {
                     .id(entry.id)
                 }
                 .listStyle(.plain)
+                .scrollContentBackground(.hidden)
                 .onChange(of: monitor.log.last?.id) { _, id in
                     if let id {
                         proxy.scrollTo(id, anchor: .bottom)
