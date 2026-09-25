@@ -66,6 +66,11 @@ final class ControllerMonitor {
     /// that input is reaching the app at all.
     private(set) var inputEventCount = 0
 
+    /// Counts changes seen by reading the controller directly on a timer.
+    /// If this climbs while `inputEventCount` stays at 0, input is reaching the
+    /// app but the event handlers are not being called.
+    private(set) var polledChangeCount = 0
+
     private(set) var log: [LogEntry] = []
 
     var isConnected: Bool { controllerName != nil }
@@ -80,6 +85,10 @@ final class ControllerMonitor {
     @ObservationIgnored private var controller: GCController?
     @ObservationIgnored private var observers: [NSObjectProtocol] = []
     @ObservationIgnored private var batteryTask: Task<Void, Never>?
+    @ObservationIgnored private var pollTask: Task<Void, Never>?
+    @ObservationIgnored private var namedButtons: [(String, GCControllerButtonInput)] = []
+    @ObservationIgnored private var lastSnapshot: [Float] = []
+    @ObservationIgnored private var loggedPollingFallback = false
     private var leftStickVertical = AxisZone()
     private var leftStickHorizontal = AxisZone()
 
@@ -190,6 +199,7 @@ final class ControllerMonitor {
         if let dualSense = pad as? GCDualSenseGamepad {
             buttons.append(("Touchpad", dualSense.touchpadButton))
         }
+        namedButtons = buttons.compactMap { name, button in button.map { (name, $0) } }
         for (name, button) in buttons {
             button?.pressedChangedHandler = { [weak self] _, _, pressed in
                 onMain { self?.buttonChanged(name, pressed: pressed) }
@@ -203,11 +213,25 @@ final class ControllerMonitor {
                 self?.refreshBattery(logIt: false)
             }
         }
+
+        lastSnapshot = snapshot(of: pad)
+        pollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(33))
+                self?.poll()
+            }
+        }
     }
 
     private func detach() {
         batteryTask?.cancel()
         batteryTask = nil
+        pollTask?.cancel()
+        pollTask = nil
+        namedButtons = []
+        lastSnapshot = []
+        loggedPollingFallback = false
+        polledChangeCount = 0
         controller = nil
         controllerName = nil
         productCategory = nil
@@ -231,6 +255,41 @@ final class ControllerMonitor {
         batteryState = battery.batteryState
         if logIt || changed {
             addLog("Battery \(Int(battery.batteryLevel * 100))%, \(Self.describe(battery.batteryState))")
+        }
+    }
+
+    // MARK: Polling
+
+    /// Every value the UI shows, in a fixed order, so two reads can be compared.
+    private func snapshot(of pad: GCExtendedGamepad) -> [Float] {
+        [
+            pad.dpad.xAxis.value, pad.dpad.yAxis.value,
+            pad.leftThumbstick.xAxis.value, pad.leftThumbstick.yAxis.value,
+            pad.rightThumbstick.xAxis.value, pad.rightThumbstick.yAxis.value,
+        ] + namedButtons.map { $0.1.value }
+    }
+
+    /// Reads the controller directly. When the event handlers have never fired,
+    /// this drives the screen instead so the app still works.
+    private func poll() {
+        guard let pad = controller?.extendedGamepad else { return }
+        let current = snapshot(of: pad)
+        guard current != lastSnapshot else { return }
+        lastSnapshot = current
+        polledChangeCount += 1
+
+        guard inputEventCount == 0 else { return }
+        if !loggedPollingFallback {
+            loggedPollingFallback = true
+            addLog("Event handlers are silent, reading the controller directly instead.")
+        }
+        dpadChanged(x: pad.dpad.xAxis.value, y: pad.dpad.yAxis.value)
+        leftStickChanged(x: pad.leftThumbstick.xAxis.value, y: pad.leftThumbstick.yAxis.value)
+        rightStick = SIMD2(pad.rightThumbstick.xAxis.value, pad.rightThumbstick.yAxis.value)
+        leftTrigger = pad.leftTrigger.value
+        rightTrigger = pad.rightTrigger.value
+        for (name, button) in namedButtons where button.isPressed != pressedButtons.contains(name) {
+            buttonChanged(name, pressed: button.isPressed)
         }
     }
 

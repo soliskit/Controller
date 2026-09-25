@@ -22,6 +22,7 @@ struct ContentView: View {
             }
             .padding()
             .navigationTitle("Controller Debug")
+            .background(GameControllerEventCapture())
             .toolbar {
                 Button("Clear Log", systemImage: "trash") {
                     monitor.clearLog()
@@ -98,6 +99,9 @@ private struct ConnectionCard: View {
                     Text("Input events received: \(monitor.inputEventCount)")
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(monitor.inputEventCount > 0 ? Color.green : Color.orange)
+                    Text("Polled changes: \(monitor.polledChangeCount)")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(monitor.polledChangeCount > 0 ? Color.green : Color.orange)
                 } else {
                     Text("No controller").font(.headline)
                     Text("Pair your DualSense in Settings, Bluetooth. Hold PS and Create until the light bar flashes.")
