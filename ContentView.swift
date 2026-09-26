@@ -11,12 +11,22 @@ struct ContentView: View {
                     HStack(alignment: .top, spacing: 16) {
                         ScrollView { StatePanel() }
                             .frame(maxWidth: 420)
-                        EventLog()
+                        // The checklist sits beside the live state so both stay
+                        // visible while working through the steps.
+                        VStack(spacing: 16) {
+                            TestChecklist()
+                                .fixedSize(horizontal: false, vertical: true)
+                            EventLog()
+                        }
                     }
                 } else {
-                    VStack(spacing: 16) {
-                        StatePanel()
-                        EventLog()
+                    ScrollView {
+                        VStack(spacing: 16) {
+                            TestChecklist()
+                            StatePanel()
+                            EventLog()
+                                .frame(height: 320)
+                        }
                     }
                 }
             }
@@ -124,7 +134,7 @@ private struct ConnectionCard: View {
     }
 }
 
-private struct Card<Content: View>: View {
+struct Card<Content: View>: View {
     let title: String
     @ViewBuilder let content: Content
 

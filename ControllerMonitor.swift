@@ -73,6 +73,15 @@ final class ControllerMonitor {
 
     private(set) var log: [LogEntry] = []
 
+    /// Results of the on screen test checklist, keyed by step.
+    private(set) var testResults: [TestStep: TestResult] = [:]
+
+    /// When the current controller connected, for the "no input yet" hint.
+    private(set) var connectedAt: Date?
+
+    /// Stays true once the event handlers have fired, even across reconnects.
+    private var handlersEverFired = false
+
     var isConnected: Bool { controllerName != nil }
 
     /// Combined up/down reading from the directional pad and left stick.
@@ -89,6 +98,7 @@ final class ControllerMonitor {
     @ObservationIgnored private var namedButtons: [(String, GCControllerButtonInput)] = []
     @ObservationIgnored private var lastSnapshot: [Float] = []
     @ObservationIgnored private var loggedPollingFallback = false
+    @ObservationIgnored private var sawDisconnect = false
     private var leftStickVertical = AxisZone()
     private var leftStickHorizontal = AxisZone()
 
@@ -143,6 +153,8 @@ final class ControllerMonitor {
         guard self.controller === controller else { return }
 
         detach()
+        sawDisconnect = true
+        pass(.turnOff)
         if let next = GCController.controllers().first(where: { $0 !== controller }) {
             attach(next)
         }
@@ -152,7 +164,12 @@ final class ControllerMonitor {
         self.controller = controller
         controllerName = displayName(of: controller)
         productCategory = controller.productCategory
+        connectedAt = .now
         controller.handlerQueue = .main
+        pass(.connect)
+        if sawDisconnect {
+            pass(.turnOn)
+        }
 
         guard let pad = controller.extendedGamepad else {
             addLog("This controller has no extended gamepad profile, so input cannot be read.")
@@ -163,7 +180,7 @@ final class ControllerMonitor {
         }
 
         pad.valueChangedHandler = { [weak self] _, _ in
-            onMain { self?.inputEventCount += 1 }
+            onMain { self?.recordInputEvent() }
         }
         pad.dpad.valueChangedHandler = { [weak self] _, x, y in
             onMain { self?.dpadChanged(x: x, y: y) }
@@ -235,6 +252,7 @@ final class ControllerMonitor {
         controller = nil
         controllerName = nil
         productCategory = nil
+        connectedAt = nil
         batteryLevel = nil
         batteryState = nil
         dpad = .zero
@@ -277,6 +295,7 @@ final class ControllerMonitor {
         guard current != lastSnapshot else { return }
         lastSnapshot = current
         polledChangeCount += 1
+        pass(.anyInput)
 
         guard inputEventCount == 0 else { return }
         if !loggedPollingFallback {
@@ -298,8 +317,14 @@ final class ControllerMonitor {
     private func dpadChanged(x: Float, y: Float) {
         let old = dpad
         dpad = SIMD2(x, y)
-        if y > 0, old.y <= 0 { addLog("D pad UP") }
-        if y < 0, old.y >= 0 { addLog("D pad DOWN") }
+        if y > 0, old.y <= 0 {
+            addLog("D pad UP")
+            pass(.dpadUp)
+        }
+        if y < 0, old.y >= 0 {
+            addLog("D pad DOWN")
+            pass(.dpadDown)
+        }
         if x < 0, old.x >= 0 { addLog("D pad LEFT") }
         if x > 0, old.x <= 0 { addLog("D pad RIGHT") }
     }
@@ -307,8 +332,12 @@ final class ControllerMonitor {
     private func leftStickChanged(x: Float, y: Float) {
         leftStick = SIMD2(x, y)
         switch leftStickVertical.update(y) {
-        case 1: addLog("Left stick UP")
-        case -1: addLog("Left stick DOWN")
+        case 1:
+            addLog("Left stick UP")
+            pass(.stickUp)
+        case -1:
+            addLog("Left stick DOWN")
+            pass(.stickDown)
         default: break
         }
         switch leftStickHorizontal.update(x) {
@@ -322,10 +351,58 @@ final class ControllerMonitor {
         if pressed {
             pressedButtons.insert(name)
             addLog("\(name) pressed")
+            switch name {
+            case "Cross": pass(.cross)
+            case "L2": pass(.leftTrigger)
+            default: break
+            }
         } else {
             pressedButtons.remove(name)
             addLog("\(name) released")
         }
+    }
+
+    private func recordInputEvent() {
+        inputEventCount += 1
+        handlersEverFired = true
+        pass(.anyInput)
+    }
+
+    // MARK: Test checklist
+
+    /// The first step that has not passed or been skipped yet.
+    var currentTestStep: TestStep? {
+        TestStep.allCases.first { testResults[$0] == nil }
+    }
+
+    /// Which route controller input took, for the test summary.
+    var inputSource: String {
+        if handlersEverFired { return "event handlers" }
+        if testResults[.anyInput] == .passed { return "direct polling, event handlers stayed silent" }
+        return "none detected"
+    }
+
+    func skipCurrentTest() {
+        guard let step = currentTestStep else { return }
+        testResults[step] = .skipped
+        addLog("Check skipped: \(step.title)")
+    }
+
+    func restartTest() {
+        testResults = [:]
+        sawDisconnect = false
+        addLog("Test restarted.")
+        if isConnected {
+            pass(.connect)
+        }
+    }
+
+    /// Marks a step passed. A skipped step still upgrades to passed if the
+    /// input turns up later.
+    private func pass(_ step: TestStep) {
+        guard testResults[step] != .passed else { return }
+        testResults[step] = .passed
+        addLog("Check passed: \(step.title)")
     }
 
     // MARK: Helpers
