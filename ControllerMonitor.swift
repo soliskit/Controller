@@ -1,12 +1,183 @@
 import GameController
 import Observation
-import SwiftUI
 
-/// One line in the on screen event log.
-struct LogEntry: Identifiable {
-    let id = UUID()
-    let date: Date
-    let message: String
+// Coding standard
+//
+// This app follows NASA JPL's "Power of Ten" rules for safety critical code,
+// adapted to Swift:
+//
+//  1. Simple control flow. No recursion.
+//  2. One cyclic frame loop is the only loop without a fixed bound. Every
+//     other loop walks a fixed size table.
+//  3. Bounded memory. Fixed size tables and a capped log; nothing grows
+//     without limit after launch.
+//  4. Short functions that fit on one screen.
+//  5. Runtime checks with an explicit recovery action. A failed check is
+//     counted and logged as a fault, shown on screen, and never crashes.
+//  6. Data at the smallest scope. Private by default, `let` where possible.
+//  7. Every input from the controller is validated before use, and every
+//     return value is used or explicitly discarded.
+//  8. No force unwraps, force casts, or `try!`.
+//  9. Named constants in `Tuning` instead of magic numbers.
+// 10. Builds with zero warnings.
+
+/// Every tuning constant in one place.
+enum Tuning {
+    /// Input is sampled on a fixed frame, like an avionics control loop.
+    static let frameRate = 60
+    static let framePeriod = Duration.seconds(1) / frameRate
+    /// Slower jobs run every this many frames: connection at 4 Hz, battery every 5 s.
+    static let connectionCheckFrames: UInt64 = 15
+    static let batteryCheckFrames: UInt64 = 300
+    /// Stick readings inside this band are sensor noise and read as zero.
+    static let stickDeadZone: Float = 0.05
+    /// A stick counts as pushed past the first value and released below the second.
+    static let stickPressThreshold: Float = 0.5
+    static let stickReleaseThreshold: Float = 0.3
+    /// Readings this far past their valid range count as invalid.
+    static let rangeTolerance: Float = 0.001
+    /// Oldest log lines are dropped past this count.
+    static let logCapacity = 500
+    /// Only this many faults are logged; later ones are still counted.
+    static let maxLoggedFaults = 20
+    /// Seconds without input before the checklist suggests a restart.
+    static let noInputHintDelay: TimeInterval = 10
+}
+
+/// Every button the app shows, in on screen order, with DualSense names.
+enum PadButton: Int, CaseIterable, Identifiable {
+    case cross, circle, square, triangle, l1, r1, l2, r2, l3, r3, create, options, ps, touchpad
+
+    var id: Int { rawValue }
+
+    var title: String {
+        switch self {
+        case .cross: "Cross"
+        case .circle: "Circle"
+        case .square: "Square"
+        case .triangle: "Triangle"
+        case .l1: "L1"
+        case .r1: "R1"
+        case .l2: "L2"
+        case .r2: "R2"
+        case .l3: "L3"
+        case .r3: "R3"
+        case .create: "Create"
+        case .options: "Options"
+        case .ps: "PS"
+        case .touchpad: "Touchpad"
+        }
+    }
+
+    /// The matching physical input, or nil when the controller lacks it.
+    func input(on pad: GCExtendedGamepad) -> GCControllerButtonInput? {
+        switch self {
+        case .cross: return pad.buttonA
+        case .circle: return pad.buttonB
+        case .square: return pad.buttonX
+        case .triangle: return pad.buttonY
+        case .l1: return pad.leftShoulder
+        case .r1: return pad.rightShoulder
+        case .l2: return pad.leftTrigger
+        case .r2: return pad.rightTrigger
+        case .l3: return pad.leftThumbstickButton
+        case .r3: return pad.rightThumbstickButton
+        case .create: return pad.buttonOptions
+        case .options: return pad.buttonMenu
+        case .ps: return pad.buttonHome
+        case .touchpad: return (pad as? GCDualSenseGamepad)?.touchpadButton
+        }
+    }
+}
+
+/// Pressed buttons as a fixed size bit set, one bit per `PadButton`.
+struct ButtonSet: Equatable {
+    static let capacity = UInt16.bitWidth
+
+    private var bits: UInt16 = 0
+
+    func contains(_ button: PadButton) -> Bool {
+        bits & (UInt16(1) << button.rawValue) != 0
+    }
+
+    mutating func insert(_ button: PadButton) {
+        bits |= UInt16(1) << button.rawValue
+    }
+}
+
+enum VerticalDirection {
+    case up, center, down
+
+    var title: String {
+        switch self {
+        case .up: "UP"
+        case .center: "CENTER"
+        case .down: "DOWN"
+        }
+    }
+}
+
+/// One frame's reading of the controller, validated and clamped.
+struct ControllerSample: Equatable {
+    /// Each component is -1...1. Positive y is up.
+    var dpad = SIMD2<Float>.zero
+    var leftStick = SIMD2<Float>.zero
+    var rightStick = SIMD2<Float>.zero
+    /// 0...1
+    var leftTrigger: Float = 0
+    var rightTrigger: Float = 0
+    var pressed = ButtonSet()
+    /// Raw readings that were not a number or out of range, and were corrected.
+    var invalidReadings = 0
+
+    static let neutral = ControllerSample()
+
+    init() {}
+
+    init(reading pad: GCExtendedGamepad) {
+        var validator = ReadingValidator()
+        dpad = validator.axes(pad.dpad, deadZone: 0)
+        leftStick = validator.axes(pad.leftThumbstick, deadZone: Tuning.stickDeadZone)
+        rightStick = validator.axes(pad.rightThumbstick, deadZone: Tuning.stickDeadZone)
+        leftTrigger = validator.unit(pad.leftTrigger.value)
+        rightTrigger = validator.unit(pad.rightTrigger.value)
+        for button in PadButton.allCases where button.input(on: pad)?.isPressed == true {
+            pressed.insert(button)
+        }
+        invalidReadings = validator.invalidCount
+    }
+}
+
+/// Validates raw readings: not a number becomes 0, out of range is clamped,
+/// and each correction is counted.
+private struct ReadingValidator {
+    private(set) var invalidCount = 0
+
+    mutating func axes(_ pad: GCControllerDirectionPad, deadZone: Float) -> SIMD2<Float> {
+        let x = axis(pad.xAxis.value, deadZone: deadZone)
+        let y = axis(pad.yAxis.value, deadZone: deadZone)
+        return SIMD2(x, y)
+    }
+
+    mutating func axis(_ raw: Float, deadZone: Float) -> Float {
+        let value = clamp(raw, to: -1...1)
+        return abs(value) < deadZone ? 0 : value
+    }
+
+    mutating func unit(_ raw: Float) -> Float {
+        clamp(raw, to: 0...1)
+    }
+
+    private mutating func clamp(_ raw: Float, to range: ClosedRange<Float>) -> Float {
+        guard raw.isFinite else {
+            invalidCount += 1
+            return 0
+        }
+        if raw < range.lowerBound - Tuning.rangeTolerance || raw > range.upperBound + Tuning.rangeTolerance {
+            invalidCount += 1
+        }
+        return min(max(raw, range.lowerBound), range.upperBound)
+    }
 }
 
 /// Tracks which side of the dead zone an analog axis is on, with hysteresis so
@@ -17,11 +188,11 @@ private struct AxisZone {
     /// Returns the new zone (-1, 0 or 1) when it changes, otherwise nil.
     mutating func update(_ axis: Float) -> Int? {
         let next: Int
-        if axis > 0.5 {
+        if axis > Tuning.stickPressThreshold {
             next = 1
-        } else if axis < -0.5 {
+        } else if axis < -Tuning.stickPressThreshold {
             next = -1
-        } else if abs(axis) < 0.3 {
+        } else if abs(axis) < Tuning.stickReleaseThreshold {
             next = 0
         } else {
             return nil
@@ -32,364 +203,272 @@ private struct AxisZone {
     }
 }
 
-/// GameController calls handlers on `handlerQueue`, which is set to the main
-/// queue, so hop onto the main actor synchronously.
-private func onMain(_ body: @MainActor () -> Void) {
-    MainActor.assumeIsolated(body)
+/// What the app knows about the connected controller.
+struct ConnectionInfo {
+    let name: String
+    let category: String
+    let connectedAt: Date
+    var batteryLevel: Float?
+    var batteryState: GCDeviceBattery.State?
 }
 
-/// Watches for a game controller and publishes its live state for SwiftUI.
+/// One line in the on screen event log.
+struct LogEntry: Identifiable {
+    let id: Int
+    let date: Date
+    let message: String
+    let isFault: Bool
+}
+
+/// Samples the game controller on a fixed frame and publishes its state for SwiftUI.
 @MainActor
 @Observable
 final class ControllerMonitor {
-    /// Buttons in the order the UI shows them, using DualSense names.
-    static let buttonNames = [
-        "Cross", "Circle", "Square", "Triangle",
-        "L1", "R1", "L2", "R2", "L3", "R3",
-        "Create", "Options", "PS", "Touchpad",
-    ]
-
-    private(set) var controllerName: String?
-    private(set) var productCategory: String?
-    private(set) var batteryLevel: Float?
-    private(set) var batteryState: GCDeviceBattery.State?
-
-    /// Each component is -1, 0 or 1. Positive y is up.
-    private(set) var dpad = SIMD2<Float>.zero
-    private(set) var leftStick = SIMD2<Float>.zero
-    private(set) var rightStick = SIMD2<Float>.zero
-    private(set) var leftTrigger: Float = 0
-    private(set) var rightTrigger: Float = 0
-    private(set) var pressedButtons: Set<String> = []
-
-    /// Counts every input change the controller reports, as a quick check
-    /// that input is reaching the app at all.
-    private(set) var inputEventCount = 0
-
-    /// Counts changes seen by reading the controller directly on a timer.
-    /// If this climbs while `inputEventCount` stays at 0, input is reaching the
-    /// app but the event handlers are not being called.
-    private(set) var polledChangeCount = 0
-
+    private(set) var connection: ConnectionInfo?
+    private(set) var sample = ControllerSample.neutral
+    private(set) var verticalDirection = VerticalDirection.center
+    /// Frames where the reading changed, as proof that input reaches the app.
+    private(set) var inputChangeCount = 0
+    private(set) var faultCount = 0
     private(set) var log: [LogEntry] = []
-
-    /// Results of the on screen test checklist, keyed by step.
-    private(set) var testResults: [TestStep: TestResult] = [:]
-
-    /// When the current controller connected, for the "no input yet" hint.
-    private(set) var connectedAt: Date?
-
-    /// Stays true once the event handlers have fired, even across reconnects.
-    private var handlersEverFired = false
-
-    var isConnected: Bool { controllerName != nil }
-
-    /// Combined up/down reading from the directional pad and left stick.
-    var verticalDirection: String {
-        if dpad.y > 0 || leftStickVertical.value > 0 { return "UP" }
-        if dpad.y < 0 || leftStickVertical.value < 0 { return "DOWN" }
-        return "CENTER"
-    }
+    /// One slot per `TestStep`, indexed by its raw value.
+    private(set) var testResults = [TestResult?](repeating: nil, count: TestStep.allCases.count)
 
     @ObservationIgnored private var controller: GCController?
-    @ObservationIgnored private var observers: [NSObjectProtocol] = []
-    @ObservationIgnored private var batteryTask: Task<Void, Never>?
-    @ObservationIgnored private var pollTask: Task<Void, Never>?
-    @ObservationIgnored private var namedButtons: [(String, GCControllerButtonInput)] = []
-    @ObservationIgnored private var lastSnapshot: [Float] = []
-    @ObservationIgnored private var loggedPollingFallback = false
+    @ObservationIgnored private var frame: UInt64 = 0
+    @ObservationIgnored private var nextLogID = 0
     @ObservationIgnored private var sawDisconnect = false
-    private var leftStickVertical = AxisZone()
-    private var leftStickHorizontal = AxisZone()
+    @ObservationIgnored private var leftStickVertical = AxisZone()
+    @ObservationIgnored private var leftStickHorizontal = AxisZone()
 
-    private let maxLogEntries = 500
+    var isConnected: Bool { connection != nil }
 
     init() {
         addLog("App started. Waiting for a controller.")
+        _ = check(PadButton.allCases.count <= ButtonSet.capacity, "Button table is larger than the button bit set")
+        _ = check(TestStep.allCases.map(\.rawValue) == Array(testResults.indices), "Test steps are not numbered in order")
 
         // Swift Playgrounds runs the app in a hosted process that the system
-        // does not treat as the frontmost app. GameController only sends input
-        // to the frontmost app unless background monitoring is on, so without
-        // this the controller connects but no button or stick events arrive.
+        // does not treat as the frontmost app. Without this, GameController
+        // withholds input from it.
         GCController.shouldMonitorBackgroundEvents = true
         addLog("Background event monitoring on.")
 
-        let center = NotificationCenter.default
-        observers.append(center.addObserver(forName: .GCControllerDidConnect, object: nil, queue: .main) { [weak self] note in
-            guard let controller = note.object as? GCController else { return }
-            onMain { self?.didConnect(controller) }
-        })
-        observers.append(center.addObserver(forName: .GCControllerDidDisconnect, object: nil, queue: .main) { [weak self] note in
-            guard let controller = note.object as? GCController else { return }
-            onMain { self?.didDisconnect(controller) }
-        })
-
-        // A controller that was already connected before launch does not post a
-        // connect notification, so pick it up here.
-        for controller in GCController.controllers() {
-            didConnect(controller)
-        }
+        checkConnection()
+        startFrameLoop()
     }
 
     func clearLog() {
         log.removeAll()
     }
 
+    // MARK: Frame loop
+
+    /// The cyclic executive. It runs for the life of the app and is the only
+    /// loop without a fixed bound. Each frame samples the controller; slower
+    /// jobs run every Nth frame.
+    private func startFrameLoop() {
+        Task { [weak self] in
+            let clock = ContinuousClock()
+            var deadline = clock.now
+            while !Task.isCancelled {
+                deadline += Tuning.framePeriod
+                // After a stall, such as the app being suspended, restart the
+                // schedule instead of running a burst of late frames.
+                if deadline < clock.now {
+                    deadline = clock.now + Tuning.framePeriod
+                }
+                do {
+                    try await Task.sleep(until: deadline, clock: clock)
+                } catch {
+                    return
+                }
+                guard let self else { return }
+                self.runFrame()
+            }
+        }
+    }
+
+    private func runFrame() {
+        frame &+= 1
+        if frame % Tuning.connectionCheckFrames == 0 {
+            checkConnection()
+        }
+        if frame % Tuning.batteryCheckFrames == 0 {
+            refreshBattery(logIt: false)
+        }
+        guard let pad = controller?.extendedGamepad else { return }
+        process(ControllerSample(reading: pad))
+    }
+
     // MARK: Connection
 
-    private func didConnect(_ controller: GCController) {
-        guard self.controller !== controller else { return }
-        addLog("Controller connected: \(displayName(of: controller))")
-
-        guard self.controller == nil else {
-            addLog("Already showing \(controllerName ?? "a controller"), ignoring the new one.")
-            return
+    /// Compares the connected controllers with the one being shown.
+    private func checkConnection() {
+        let connected = GCController.controllers()
+        if let current = controller, !connected.contains(where: { $0 === current }) {
+            didDisconnect()
         }
-        attach(controller)
-    }
-
-    private func didDisconnect(_ controller: GCController) {
-        addLog("Controller disconnected: \(displayName(of: controller))")
-        guard self.controller === controller else { return }
-
-        detach()
-        sawDisconnect = true
-        pass(.turnOff)
-        if let next = GCController.controllers().first(where: { $0 !== controller }) {
-            attach(next)
+        if controller == nil, let next = connected.first {
+            didConnect(next)
         }
     }
 
-    private func attach(_ controller: GCController) {
-        self.controller = controller
-        controllerName = displayName(of: controller)
-        productCategory = controller.productCategory
-        connectedAt = .now
-        controller.handlerQueue = .main
+    private func didConnect(_ newController: GCController) {
+        let name = newController.vendorName ?? newController.productCategory
+        controller = newController
+        connection = ConnectionInfo(name: name, category: newController.productCategory, connectedAt: .now)
+        addLog("Controller connected: \(name)")
         pass(.connect)
         if sawDisconnect {
             pass(.turnOn)
         }
-
-        guard let pad = controller.extendedGamepad else {
+        if let pad = newController.extendedGamepad {
+            if pad is GCDualSenseGamepad {
+                addLog("DualSense profile detected.")
+            }
+        } else {
             addLog("This controller has no extended gamepad profile, so input cannot be read.")
-            return
         }
-        if pad is GCDualSenseGamepad {
-            addLog("DualSense profile detected.")
-        }
-
-        pad.valueChangedHandler = { [weak self] _, _ in
-            onMain { self?.recordInputEvent() }
-        }
-        pad.dpad.valueChangedHandler = { [weak self] _, x, y in
-            onMain { self?.dpadChanged(x: x, y: y) }
-        }
-        pad.leftThumbstick.valueChangedHandler = { [weak self] _, x, y in
-            onMain { self?.leftStickChanged(x: x, y: y) }
-        }
-        pad.rightThumbstick.valueChangedHandler = { [weak self] _, x, y in
-            onMain { self?.rightStick = SIMD2(x, y) }
-        }
-        pad.leftTrigger.valueChangedHandler = { [weak self] _, value, _ in
-            onMain { self?.leftTrigger = value }
-        }
-        pad.rightTrigger.valueChangedHandler = { [weak self] _, value, _ in
-            onMain { self?.rightTrigger = value }
-        }
-
-        var buttons: [(String, GCControllerButtonInput?)] = [
-            ("Cross", pad.buttonA),
-            ("Circle", pad.buttonB),
-            ("Square", pad.buttonX),
-            ("Triangle", pad.buttonY),
-            ("L1", pad.leftShoulder),
-            ("R1", pad.rightShoulder),
-            ("L2", pad.leftTrigger),
-            ("R2", pad.rightTrigger),
-            ("L3", pad.leftThumbstickButton),
-            ("R3", pad.rightThumbstickButton),
-            ("Create", pad.buttonOptions),
-            ("Options", pad.buttonMenu),
-            ("PS", pad.buttonHome),
-        ]
-        if let dualSense = pad as? GCDualSenseGamepad {
-            buttons.append(("Touchpad", dualSense.touchpadButton))
-        }
-        namedButtons = buttons.compactMap { name, button in button.map { (name, $0) } }
-        for (name, button) in buttons {
-            button?.pressedChangedHandler = { [weak self] _, _, pressed in
-                onMain { self?.buttonChanged(name, pressed: pressed) }
-            }
-        }
-
         refreshBattery(logIt: true)
-        batteryTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(5))
-                self?.refreshBattery(logIt: false)
-            }
-        }
-
-        lastSnapshot = snapshot(of: pad)
-        pollTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(33))
-                self?.poll()
-            }
-        }
     }
 
-    private func detach() {
-        batteryTask?.cancel()
-        batteryTask = nil
-        pollTask?.cancel()
-        pollTask = nil
-        namedButtons = []
-        lastSnapshot = []
-        loggedPollingFallback = false
-        polledChangeCount = 0
+    private func didDisconnect() {
+        addLog("Controller disconnected: \(connection?.name ?? "unknown")")
         controller = nil
-        controllerName = nil
-        productCategory = nil
-        connectedAt = nil
-        batteryLevel = nil
-        batteryState = nil
-        dpad = .zero
-        leftStick = .zero
-        rightStick = .zero
-        leftTrigger = 0
-        rightTrigger = 0
-        pressedButtons = []
-        inputEventCount = 0
+        connection = nil
+        sample = .neutral
+        verticalDirection = .center
+        inputChangeCount = 0
         leftStickVertical = AxisZone()
         leftStickHorizontal = AxisZone()
+        sawDisconnect = true
+        pass(.turnOff)
     }
 
     private func refreshBattery(logIt: Bool) {
-        guard let battery = controller?.battery else { return }
-        let changed = batteryState != battery.batteryState
-        batteryLevel = battery.batteryLevel
-        batteryState = battery.batteryState
-        if logIt || changed {
-            addLog("Battery \(Int(battery.batteryLevel * 100))%, \(Self.describe(battery.batteryState))")
-        }
-    }
-
-    // MARK: Polling
-
-    /// Every value the UI shows, in a fixed order, so two reads can be compared.
-    private func snapshot(of pad: GCExtendedGamepad) -> [Float] {
-        [
-            pad.dpad.xAxis.value, pad.dpad.yAxis.value,
-            pad.leftThumbstick.xAxis.value, pad.leftThumbstick.yAxis.value,
-            pad.rightThumbstick.xAxis.value, pad.rightThumbstick.yAxis.value,
-        ] + namedButtons.map { $0.1.value }
-    }
-
-    /// Reads the controller directly. When the event handlers have never fired,
-    /// this drives the screen instead so the app still works.
-    private func poll() {
-        guard let pad = controller?.extendedGamepad else { return }
-        let current = snapshot(of: pad)
-        guard current != lastSnapshot else { return }
-        lastSnapshot = current
-        polledChangeCount += 1
-        pass(.anyInput)
-
-        guard inputEventCount == 0 else { return }
-        if !loggedPollingFallback {
-            loggedPollingFallback = true
-            addLog("Event handlers are silent, reading the controller directly instead.")
-        }
-        dpadChanged(x: pad.dpad.xAxis.value, y: pad.dpad.yAxis.value)
-        leftStickChanged(x: pad.leftThumbstick.xAxis.value, y: pad.leftThumbstick.yAxis.value)
-        rightStick = SIMD2(pad.rightThumbstick.xAxis.value, pad.rightThumbstick.yAxis.value)
-        leftTrigger = pad.leftTrigger.value
-        rightTrigger = pad.rightTrigger.value
-        for (name, button) in namedButtons where button.isPressed != pressedButtons.contains(name) {
-            buttonChanged(name, pressed: button.isPressed)
+        guard var info = connection, let battery = controller?.battery else { return }
+        let level = battery.batteryLevel
+        let state = battery.batteryState
+        guard check(level.isFinite && (0...1).contains(level), "Battery level \(level) is out of range") else { return }
+        let stateChanged = info.batteryState != state
+        guard logIt || stateChanged || info.batteryLevel != level else { return }
+        info.batteryLevel = level
+        info.batteryState = state
+        connection = info
+        if logIt || stateChanged {
+            addLog("Battery \(Int(level * 100))%, \(state.title)")
         }
     }
 
     // MARK: Input
 
-    private func dpadChanged(x: Float, y: Float) {
-        let old = dpad
-        dpad = SIMD2(x, y)
-        if y > 0, old.y <= 0 {
+    private func process(_ next: ControllerSample) {
+        guard next != sample else { return }
+        if next.invalidReadings > 0 {
+            recordFault("Invalid controller readings corrected: \(next.invalidReadings)")
+        }
+        let previous = sample
+        sample = next
+        inputChangeCount += 1
+        pass(.anyInput)
+        reportDpad(from: previous.dpad, to: next.dpad)
+        reportLeftStick(next.leftStick)
+        reportButtons(from: previous.pressed, to: next.pressed)
+        updateVerticalDirection()
+    }
+
+    private func reportDpad(from old: SIMD2<Float>, to new: SIMD2<Float>) {
+        if new.y > 0, old.y <= 0 {
             addLog("D pad UP")
             pass(.dpadUp)
         }
-        if y < 0, old.y >= 0 {
+        if new.y < 0, old.y >= 0 {
             addLog("D pad DOWN")
             pass(.dpadDown)
         }
-        if x < 0, old.x >= 0 { addLog("D pad LEFT") }
-        if x > 0, old.x <= 0 { addLog("D pad RIGHT") }
+        if new.x < 0, old.x >= 0 {
+            addLog("D pad LEFT")
+        }
+        if new.x > 0, old.x <= 0 {
+            addLog("D pad RIGHT")
+        }
     }
 
-    private func leftStickChanged(x: Float, y: Float) {
-        leftStick = SIMD2(x, y)
-        switch leftStickVertical.update(y) {
+    private func reportLeftStick(_ stick: SIMD2<Float>) {
+        switch leftStickVertical.update(stick.y) {
         case 1:
             addLog("Left stick UP")
             pass(.stickUp)
         case -1:
             addLog("Left stick DOWN")
             pass(.stickDown)
-        default: break
+        default:
+            break
         }
-        switch leftStickHorizontal.update(x) {
+        switch leftStickHorizontal.update(stick.x) {
         case 1: addLog("Left stick RIGHT")
         case -1: addLog("Left stick LEFT")
         default: break
         }
     }
 
-    private func buttonChanged(_ name: String, pressed: Bool) {
-        if pressed {
-            pressedButtons.insert(name)
-            addLog("\(name) pressed")
-            switch name {
-            case "Cross": pass(.cross)
-            case "L2": pass(.leftTrigger)
-            default: break
+    private func reportButtons(from old: ButtonSet, to new: ButtonSet) {
+        guard old != new else { return }
+        for button in PadButton.allCases {
+            let wasPressed = old.contains(button)
+            let isPressed = new.contains(button)
+            if isPressed, !wasPressed {
+                addLog("\(button.title) pressed")
+                if let step = TestStep(pressing: button) {
+                    pass(step)
+                }
+            } else if wasPressed, !isPressed {
+                addLog("\(button.title) released")
             }
-        } else {
-            pressedButtons.remove(name)
-            addLog("\(name) released")
         }
     }
 
-    private func recordInputEvent() {
-        inputEventCount += 1
-        handlersEverFired = true
-        pass(.anyInput)
+    private func updateVerticalDirection() {
+        let dpad = sample.dpad.y
+        let stick = leftStickVertical.value
+        let next: VerticalDirection
+        if dpad > 0 || stick > 0 {
+            next = .up
+        } else if dpad < 0 || stick < 0 {
+            next = .down
+        } else {
+            next = .center
+        }
+        if next != verticalDirection {
+            verticalDirection = next
+        }
     }
 
     // MARK: Test checklist
 
     /// The first step that has not passed or been skipped yet.
     var currentTestStep: TestStep? {
-        TestStep.allCases.first { testResults[$0] == nil }
+        TestStep.allCases.first { result(for: $0) == nil }
     }
 
-    /// Which route controller input took, for the test summary.
-    var inputSource: String {
-        if handlersEverFired { return "event handlers" }
-        if testResults[.anyInput] == .passed { return "direct polling, event handlers stayed silent" }
-        return "none detected"
+    var skippedCount: Int {
+        testResults.filter { $0 == .skipped }.count
+    }
+
+    func result(for step: TestStep) -> TestResult? {
+        guard let slot = slot(for: step) else { return nil }
+        return testResults[slot]
     }
 
     func skipCurrentTest() {
-        guard let step = currentTestStep else { return }
-        testResults[step] = .skipped
+        guard let step = currentTestStep, let slot = slot(for: step) else { return }
+        testResults[slot] = .skipped
         addLog("Check skipped: \(step.title)")
     }
 
     func restartTest() {
-        testResults = [:]
+        testResults = [TestResult?](repeating: nil, count: TestStep.allCases.count)
         sawDisconnect = false
         addLog("Test restarted.")
         if isConnected {
@@ -400,26 +479,50 @@ final class ControllerMonitor {
     /// Marks a step passed. A skipped step still upgrades to passed if the
     /// input turns up later.
     private func pass(_ step: TestStep) {
-        guard testResults[step] != .passed else { return }
-        testResults[step] = .passed
+        guard let slot = slot(for: step), testResults[slot] != .passed else { return }
+        testResults[slot] = .passed
         addLog("Check passed: \(step.title)")
     }
 
-    // MARK: Helpers
+    /// The table index for a step, or nil (and a fault) if it is out of range.
+    private func slot(for step: TestStep) -> Int? {
+        guard check(testResults.indices.contains(step.rawValue), "Test step \(step.rawValue) has no result slot") else { return nil }
+        return step.rawValue
+    }
 
-    private func addLog(_ message: String) {
-        log.append(LogEntry(date: .now, message: message))
-        if log.count > maxLogEntries {
-            log.removeFirst(log.count - maxLogEntries)
+    // MARK: Faults and log
+
+    /// A runtime check with a recovery path. When `condition` is false the
+    /// failure is recorded as a fault and false is returned, so the caller can
+    /// take its recovery action. It never stops the app.
+    private func check(_ condition: Bool, _ fault: @autoclosure () -> String) -> Bool {
+        if !condition {
+            recordFault(fault())
+        }
+        return condition
+    }
+
+    private func recordFault(_ message: String) {
+        faultCount += 1
+        if faultCount <= Tuning.maxLoggedFaults {
+            addLog("FAULT: \(message)", isFault: true)
+        } else if faultCount == Tuning.maxLoggedFaults + 1 {
+            addLog("FAULT: further faults are counted but not logged.", isFault: true)
         }
     }
 
-    private func displayName(of controller: GCController) -> String {
-        controller.vendorName ?? controller.productCategory
+    private func addLog(_ message: String, isFault: Bool = false) {
+        log.append(LogEntry(id: nextLogID, date: .now, message: message, isFault: isFault))
+        nextLogID &+= 1
+        if log.count > Tuning.logCapacity {
+            log.removeFirst(log.count - Tuning.logCapacity)
+        }
     }
+}
 
-    static func describe(_ state: GCDeviceBattery.State) -> String {
-        switch state {
+extension GCDeviceBattery.State {
+    var title: String {
+        switch self {
         case .charging: "charging"
         case .discharging: "on battery"
         case .full: "full"

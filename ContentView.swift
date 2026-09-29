@@ -48,37 +48,38 @@ private struct StatePanel: View {
     @Environment(ControllerMonitor.self) private var monitor
 
     var body: some View {
+        let sample = monitor.sample
         VStack(spacing: 12) {
             ConnectionCard()
 
             Card(title: "Up / Down") {
-                Text(monitor.verticalDirection)
+                Text(monitor.verticalDirection.title)
                     .font(.system(size: 44, weight: .bold, design: .rounded))
-                    .foregroundStyle(monitor.verticalDirection == "CENTER" ? Color.secondary : Color.accentColor)
+                    .foregroundStyle(monitor.verticalDirection == .center ? Color.secondary : Color.accentColor)
                     .frame(maxWidth: .infinity)
                     .contentTransition(.numericText())
                     .animation(.snappy, value: monitor.verticalDirection)
             }
 
             HStack(spacing: 12) {
-                Card(title: "D Pad") { DirectionPad(value: monitor.dpad) }
-                Card(title: "Left Stick") { StickView(value: monitor.leftStick) }
-                Card(title: "Right Stick") { StickView(value: monitor.rightStick) }
+                Card(title: "D Pad") { DirectionPad(value: sample.dpad) }
+                Card(title: "Left Stick") { StickView(value: sample.leftStick) }
+                Card(title: "Right Stick") { StickView(value: sample.rightStick) }
             }
             .fixedSize(horizontal: false, vertical: true)
 
             Card(title: "Triggers") {
                 VStack(spacing: 8) {
-                    TriggerBar(label: "L2", value: monitor.leftTrigger)
-                    TriggerBar(label: "R2", value: monitor.rightTrigger)
+                    TriggerBar(label: PadButton.l2.title, value: sample.leftTrigger)
+                    TriggerBar(label: PadButton.r2.title, value: sample.rightTrigger)
                 }
             }
 
             Card(title: "Buttons") {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 80))], spacing: 8) {
-                    ForEach(ControllerMonitor.buttonNames, id: \.self) { name in
-                        let pressed = monitor.pressedButtons.contains(name)
-                        Text(name)
+                    ForEach(PadButton.allCases) { button in
+                        let pressed = sample.pressed.contains(button)
+                        Text(button.title)
                             .font(.callout.weight(.semibold))
                             .frame(maxWidth: .infinity, minHeight: 32)
                             .background(pressed ? Color.accentColor : Color.secondary.opacity(0.15), in: .capsule)
@@ -100,37 +101,46 @@ private struct ConnectionCard: View {
                 .fill(monitor.isConnected ? Color.green : Color.red)
                 .frame(width: 14, height: 14)
             VStack(alignment: .leading, spacing: 2) {
-                if let name = monitor.controllerName {
+                if let info = monitor.connection {
                     Text("Connected").font(.headline)
-                    Text(name).foregroundStyle(.secondary)
-                    if let category = monitor.productCategory, category != name {
-                        Text(category).font(.caption).foregroundStyle(.secondary)
+                    Text(info.name).foregroundStyle(.secondary)
+                    if info.category != info.name {
+                        Text(info.category).font(.caption).foregroundStyle(.secondary)
                     }
-                    Text("Input events received: \(monitor.inputEventCount)")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(monitor.inputEventCount > 0 ? Color.green : Color.orange)
-                    Text("Polled changes: \(monitor.polledChangeCount)")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(monitor.polledChangeCount > 0 ? Color.green : Color.orange)
+                    StatusLine(label: "Input changes", value: monitor.inputChangeCount,
+                               color: monitor.inputChangeCount > 0 ? .green : .orange)
                 } else {
                     Text("No controller").font(.headline)
                     Text("Pair your DualSense in Settings, Bluetooth. Hold PS and Create until the light bar flashes.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                StatusLine(label: "Faults", value: monitor.faultCount,
+                           color: monitor.faultCount == 0 ? .green : .red)
             }
             Spacer()
-            if let level = monitor.batteryLevel, let state = monitor.batteryState {
+            if let level = monitor.connection?.batteryLevel, let state = monitor.connection?.batteryState {
                 VStack(alignment: .trailing) {
                     Label("\(Int(level * 100))%", systemImage: state == .charging ? "battery.100percent.bolt" : "battery.75percent")
                         .monospacedDigit()
-                    Text(ControllerMonitor.describe(state)).font(.caption).foregroundStyle(.secondary)
+                    Text(state.title).font(.caption).foregroundStyle(.secondary)
                 }
             }
         }
-        .padding()
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.background.secondary, in: .rect(cornerRadius: 12))
+        .cardStyle()
+    }
+}
+
+/// A labeled counter, colored by whether its value is healthy.
+private struct StatusLine: View {
+    let label: String
+    let value: Int
+    let color: Color
+
+    var body: some View {
+        Text("\(label): \(value)")
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(color)
     }
 }
 
@@ -146,9 +156,16 @@ struct Card<Content: View>: View {
                 .textCase(.uppercase)
             content
         }
-        .padding()
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(.background.secondary, in: .rect(cornerRadius: 12))
+        .cardStyle()
+    }
+}
+
+private extension View {
+    /// The rounded panel shared by every card.
+    func cardStyle() -> some View {
+        padding()
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .background(.background.secondary, in: .rect(cornerRadius: 12))
     }
 }
 
@@ -158,22 +175,26 @@ private struct DirectionPad: View {
     var body: some View {
         Grid(horizontalSpacing: 2, verticalSpacing: 2) {
             GridRow {
-                Color.clear.gridCellUnsizedAxes([.horizontal, .vertical])
+                blank
                 arrow("arrowtriangle.up.fill", on: value.y > 0)
-                Color.clear.gridCellUnsizedAxes([.horizontal, .vertical])
+                blank
             }
             GridRow {
                 arrow("arrowtriangle.left.fill", on: value.x < 0)
-                Color.clear.gridCellUnsizedAxes([.horizontal, .vertical])
+                blank
                 arrow("arrowtriangle.right.fill", on: value.x > 0)
             }
             GridRow {
-                Color.clear.gridCellUnsizedAxes([.horizontal, .vertical])
+                blank
                 arrow("arrowtriangle.down.fill", on: value.y < 0)
-                Color.clear.gridCellUnsizedAxes([.horizontal, .vertical])
+                blank
             }
         }
         .frame(maxWidth: .infinity)
+    }
+
+    private var blank: some View {
+        Color.clear.gridCellUnsizedAxes([.horizontal, .vertical])
     }
 
     private func arrow(_ symbol: String, on: Bool) -> some View {
@@ -229,18 +250,14 @@ private struct EventLog: View {
     @Environment(ControllerMonitor.self) private var monitor
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Event Log")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .textCase(.uppercase)
-
+        Card(title: "Event Log") {
             ScrollViewReader { proxy in
                 List(monitor.log) { entry in
                     HStack(alignment: .firstTextBaseline, spacing: 12) {
                         Text(entry.date, format: .dateTime.hour().minute().second().secondFraction(.fractional(3)))
                             .foregroundStyle(.secondary)
                         Text(entry.message)
+                            .foregroundStyle(entry.isFault ? Color.red : Color.primary)
                     }
                     .font(.system(.callout, design: .monospaced))
                     .id(entry.id)
@@ -254,8 +271,5 @@ private struct EventLog: View {
                 }
             }
         }
-        .padding()
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(.background.secondary, in: .rect(cornerRadius: 12))
     }
 }

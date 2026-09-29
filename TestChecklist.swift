@@ -42,7 +42,7 @@ enum TestStep: Int, CaseIterable, Identifiable {
     var expectation: String {
         switch self {
         case .connect: "The dot turns green and the log says Controller connected."
-        case .anyInput: "Input events received or Polled changes goes above 0."
+        case .anyInput: "Input changes on the connection card goes above 0."
         case .dpadUp: "The UP / DOWN card shows UP and the up arrow lights."
         case .dpadDown: "The UP / DOWN card shows DOWN and the down arrow lights."
         case .stickUp: "The left stick dot moves up and the UP / DOWN card shows UP."
@@ -67,6 +67,17 @@ enum TestResult {
     case passed, skipped
 }
 
+extension TestStep {
+    /// The step a button press completes, if any.
+    init?(pressing button: PadButton) {
+        switch button {
+        case .cross: self = .cross
+        case .l2: self = .leftTrigger
+        default: return nil
+        }
+    }
+}
+
 /// Walks the user through each check. Steps tick off by themselves as the
 /// controller reports the matching input.
 struct TestChecklist: View {
@@ -86,7 +97,7 @@ struct TestChecklist: View {
             // leave room for the event log below it.
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 200), alignment: .leading)], alignment: .leading, spacing: 6) {
                 ForEach(TestStep.allCases) { step in
-                    StepRow(step: step, result: monitor.testResults[step], isCurrent: step == monitor.currentTestStep)
+                    StepRow(step: step, result: monitor.result(for: step), isCurrent: step == monitor.currentTestStep)
                 }
             }
 
@@ -125,10 +136,10 @@ private struct CurrentStep: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            if step == .anyInput, let since = monitor.connectedAt {
+            if step == .anyInput, let since = monitor.connection?.connectedAt {
                 // If input never arrives, suggest the known Swift Playgrounds workaround.
                 TimelineView(.periodic(from: since, by: 1)) { context in
-                    if context.date.timeIntervalSince(since) > 10 {
+                    if context.date.timeIntervalSince(since) > Tuning.noInputHintDelay {
                         Label("Nothing yet? Close Swift Playgrounds completely, turn the controller off, run the app again, then turn the controller on.", systemImage: "exclamationmark.triangle.fill")
                             .font(.callout)
                             .foregroundStyle(Color.orange)
@@ -143,14 +154,15 @@ private struct Summary: View {
     @Environment(ControllerMonitor.self) private var monitor
 
     var body: some View {
-        let skipped = monitor.testResults.values.filter { $0 == .skipped }.count
+        let skipped = monitor.skippedCount
+        let clean = skipped == 0 && monitor.faultCount == 0
         VStack(alignment: .leading, spacing: 6) {
-            Label(skipped == 0 ? "All checks passed" : "Test finished", systemImage: "checkmark.seal.fill")
+            Label(clean ? "All checks passed" : "Test finished", systemImage: "checkmark.seal.fill")
                 .font(.title2.weight(.bold))
-                .foregroundStyle(skipped == 0 ? Color.green : Color.orange)
+                .foregroundStyle(clean ? Color.green : Color.orange)
             Text("\(TestStep.allCases.count - skipped) passed, \(skipped) skipped.")
-            Text("Input route: \(monitor.inputSource)")
-                .foregroundStyle(.secondary)
+            Text("Faults: \(monitor.faultCount)")
+                .foregroundStyle(monitor.faultCount == 0 ? Color.secondary : Color.red)
         }
         .font(.callout)
     }
